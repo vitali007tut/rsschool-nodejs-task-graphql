@@ -5,12 +5,10 @@ import { createTypes } from './types.js';
 
 const plugin: FastifyPluginAsyncTypebox = async (fastify) => {
   const { prisma } = fastify;
-
   const { RootQueryType } = createTypes(prisma);
   const schema = new GraphQLSchema({
     query: RootQueryType,
   });
-
   fastify.route({
     url: '/',
     method: 'POST',
