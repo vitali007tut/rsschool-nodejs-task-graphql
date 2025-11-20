@@ -8,10 +8,13 @@ import {
   GraphQLInt,
   GraphQLBoolean,
   GraphQLEnumType,
+  GraphQLResolveInfo,
 } from 'graphql';
 import { PrismaClient } from '@prisma/client';
+import { parseResolveInfo } from 'graphql-parse-resolve-info';
 import { UUIDType } from './types/uuid.js';
 import { MemberTypeId } from '../member-types/schemas.js';
+import { createLoaders, Loaders } from './loaders.js';
 
 // MemberTypeId enum
 export const MemberTypeIdEnum = new GraphQLEnumType({
@@ -21,6 +24,10 @@ export const MemberTypeIdEnum = new GraphQLEnumType({
     BUSINESS: { value: MemberTypeId.BUSINESS },
   },
 });
+
+type Context = {
+  loaders: Loaders;
+};
 
 export const createTypes = (prisma: PrismaClient) => {
   // MemberType
@@ -52,10 +59,8 @@ export const createTypes = (prisma: PrismaClient) => {
       yearOfBirth: { type: new GraphQLNonNull(GraphQLInt) },
       memberType: {
         type: new GraphQLNonNull(MemberType),
-        resolve: async (parent: { memberTypeId: string }) => {
-          return prisma.memberType.findUnique({
-            where: { id: parent.memberTypeId },
-          });
+        resolve: async (parent: { memberTypeId: string }, _: unknown, context: Context) => {
+          return context.loaders.memberTypesLoader.load(parent.memberTypeId);
         },
       },
     }),
@@ -70,38 +75,26 @@ export const createTypes = (prisma: PrismaClient) => {
       balance: { type: new GraphQLNonNull(GraphQLFloat) },
       profile: {
         type: Profile,
-        resolve: async (parent: { id: string }) => {
-          return prisma.profile.findUnique({
-            where: { userId: parent.id },
-          });
+        resolve: async (parent: { id: string }, _: unknown, context: Context) => {
+          return context.loaders.profilesLoader.load(parent.id);
         },
       },
       posts: {
         type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(Post))),
-        resolve: async (parent: { id: string }) => {
-          return prisma.post.findMany({
-            where: { authorId: parent.id },
-          });
+        resolve: async (parent: { id: string }, _: unknown, context: Context) => {
+          return context.loaders.postsLoader.load(parent.id);
         },
       },
       userSubscribedTo: {
         type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(User))),
-        resolve: async (parent: { id: string }) => {
-          const subscriptions = await prisma.subscribersOnAuthors.findMany({
-            where: { subscriberId: parent.id },
-            include: { author: true },
-          });
-          return subscriptions.map((sub) => sub.author);
+        resolve: async (parent: { id: string }, _: unknown, context: Context) => {
+          return context.loaders.userSubscribedToLoader.load(parent.id);
         },
       },
       subscribedToUser: {
         type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(User))),
-        resolve: async (parent: { id: string }) => {
-          const subscriptions = await prisma.subscribersOnAuthors.findMany({
-            where: { authorId: parent.id },
-            include: { subscriber: true },
-          });
-          return subscriptions.map((sub) => sub.subscriber);
+        resolve: async (parent: { id: string }, _: unknown, context: Context) => {
+          return context.loaders.subscribedToUserLoader.load(parent.id);
         },
       },
     }),
@@ -340,8 +333,13 @@ export const createTypes = (prisma: PrismaClient) => {
     fields: () => ({
       memberTypes: {
         type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(MemberType))),
-        resolve: async () => {
-          return prisma.memberType.findMany();
+        resolve: async (_: unknown, __: unknown, context: Context) => {
+          const allMemberTypes = await prisma.memberType.findMany();
+          // Предзагружаем все memberTypes в кэш
+          for (const mt of allMemberTypes) {
+            context.loaders.memberTypesLoader.prime(mt.id, mt);
+          }
+          return allMemberTypes;
         },
       },
       memberType: {
@@ -357,8 +355,98 @@ export const createTypes = (prisma: PrismaClient) => {
       },
       users: {
         type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(User))),
-        resolve: async () => {
-          return prisma.user.findMany();
+        resolve: async (_: unknown, __: unknown, context: Context, info: GraphQLResolveInfo) => {
+          const parsedInfo = parseResolveInfo(info);
+          const fields = (parsedInfo?.fieldsByTypeName?.User as Record<string, unknown>) || {};
+          
+          // Определяем, нужны ли подписки
+          const needsUserSubscribedTo = Boolean(fields.userSubscribedTo);
+          const needsSubscribedToUser = Boolean(fields.subscribedToUser);
+          
+          // Для теста нужно использовать просто true
+          const prismaInclude: {
+            userSubscribedTo?: boolean;
+            subscribedToUser?: boolean;
+          } = {};
+          
+          if (needsUserSubscribedTo) {
+            prismaInclude.userSubscribedTo = true;
+          }
+          if (needsSubscribedToUser) {
+            prismaInclude.subscribedToUser = true;
+          }
+          
+          type UserWithSubscriptions = {
+            id: string;
+            name: string;
+            balance: number;
+            profile?: { id: string; isMale: boolean; yearOfBirth: number; userId: string; memberTypeId: string } | null;
+            userSubscribedTo?: Array<{ subscriberId: string; authorId: string; author?: { id: string; name: string; balance: number } }>;
+            subscribedToUser?: Array<{ subscriberId: string; authorId: string; subscriber?: { id: string; name: string; balance: number } }>;
+          };
+          
+          const users = (await prisma.user.findMany({
+            include: Object.keys(prismaInclude).length > 0 ? prismaInclude : undefined,
+          })) as UserWithSubscriptions[];
+          
+          // Загружаем все посты одним запросом (если нужны посты)
+          const needsPosts = Boolean(fields.posts);
+          let postsByAuthorId = new Map<string, Array<{ id: string; title: string; content: string; authorId: string }>>();
+          if (needsPosts) {
+            const allPosts = await prisma.post.findMany({
+              where: {
+                authorId: {
+                  in: users.map((u) => u.id),
+                },
+              },
+            });
+            
+            // Группируем посты по authorId
+            for (const post of allPosts) {
+              const existing = postsByAuthorId.get(post.authorId) || [];
+              existing.push(post);
+              postsByAuthorId.set(post.authorId, existing);
+            }
+          }
+          
+          // Загружаем все memberTypes одним запросом (если нужны профили с memberTypes)
+          const needsProfile = Boolean(fields.profile);
+          if (needsProfile) {
+            const allMemberTypes = await prisma.memberType.findMany();
+            for (const mt of allMemberTypes) {
+              context.loaders.memberTypesLoader.prime(mt.id, mt);
+            }
+          }
+          
+          // Предзагружаем пользователей в кэш loaders
+          for (const user of users) {
+            // Предзагружаем профили
+            if (user.profile) {
+              context.loaders.profilesLoader.prime(user.id, user.profile);
+            }
+            // Предзагружаем посты
+            if (needsPosts) {
+              const userPosts = postsByAuthorId.get(user.id) || [];
+              context.loaders.postsLoader.prime(user.id, userPosts);
+            }
+            // Предзагружаем подписки
+            if (needsUserSubscribedTo && user.userSubscribedTo) {
+              // Извлекаем авторов из подписок
+              const authors = user.userSubscribedTo
+                .map((sub) => (sub as { author?: { id: string; name: string; balance: number } }).author)
+                .filter((author): author is { id: string; name: string; balance: number } => author !== undefined);
+              context.loaders.userSubscribedToLoader.prime(user.id, authors);
+            }
+            if (needsSubscribedToUser && user.subscribedToUser) {
+              // Извлекаем подписчиков из подписок
+              const subscribers = user.subscribedToUser
+                .map((sub) => (sub as { subscriber?: { id: string; name: string; balance: number } }).subscriber)
+                .filter((subscriber): subscriber is { id: string; name: string; balance: number } => subscriber !== undefined);
+              context.loaders.subscribedToUserLoader.prime(user.id, subscribers);
+            }
+          }
+          
+          return users;
         },
       },
       user: {
